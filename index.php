@@ -1,3 +1,466 @@
+<?php
+session_start();
+
+// Simple file-based storage for device tracking and user authentication
+// In a real application, you would use a database
+define('DEVICE_DB_FILE', 'devices.json');
+define('USERS_DB_FILE', 'users.json');
+
+// Ensure the database files exist
+if (!file_exists(DEVICE_DB_FILE)) {
+    file_put_contents(DEVICE_DB_FILE, json_encode([]));
+}
+
+if (!file_exists(USERS_DB_FILE)) {
+    // Create a default user for testing: username "demo", password "password"
+    $defaultUsers = [
+        'demo' => [
+            'password' => password_hash('password', PASSWORD_DEFAULT),
+            'created' => date('Y-m-d H:i:s')
+        ]
+    ];
+    file_put_contents(USERS_DB_FILE, json_encode($defaultUsers));
+}
+
+function loadUsers() {
+    $json = file_get_contents(USERS_DB_FILE);
+    return json_decode($json, true) ?: [];
+}
+
+function saveUsers($users) {
+    file_put_contents(USERS_DB_FILE, json_encode($users));
+}
+
+function authenticateUser($username, $password, $deviceId, $userAgent, $platform) {
+    $users = loadUsers();
+    
+    if (isset($users[$username]) && password_verify($password, $users[$username]['password'])) {
+        // Check if user already has an active device
+        $devices = loadDevices();
+        
+        if (isset($devices[$username]) && count($devices[$username]) > 0) {
+            // Check if any device is still active (accessed in the last 30 minutes)
+            $isActive = false;
+            $currentTime = time();
+            
+            foreach ($devices[$username] as $deviceId => $device) {
+                $lastAccessTime = strtotime($device['lastAccess']);
+                
+                // Consider device active if accessed in the last 30 minutes
+                if (($currentTime - $lastAccessTime) < (30 * 60)) {
+                    $isActive = true;
+                    break;
+                }
+            }
+            
+            if ($isActive) {
+                return [
+                    'success' => false,
+                    'message' => 'Access denied: User is already logged in on another device. Please logout from the other device first.'
+                ];
+            }
+        }
+        
+        // Store user in session
+        $_SESSION['username'] = $username;
+        
+        // Automatically register the device
+        // First device for this user
+        $devices[$username][$deviceId] = [
+            'deviceId' => $deviceId,
+            'firstAccess' => date('Y-m-d H:i:s'),
+            'lastAccess' => date('Y-m-d H:i:s'),
+            'userAgent' => $userAgent,
+            'platform' => $platform
+        ];
+        saveDevices($devices);
+        
+        return [
+            'success' => true,
+            'message' => 'Login successful. Device automatically registered.'
+        ];
+    }
+    
+    return [
+        'success' => false,
+        'message' => 'Invalid username or password'
+    ];
+}
+
+function logoutUser() {
+    $username = getCurrentUser();
+    
+    if ($username) {
+        // Remove the user's devices from tracking
+        $devices = loadDevices();
+        unset($devices[$username]);
+        saveDevices($devices);
+    }
+    
+    unset($_SESSION['username']);
+    return [
+        'success' => true,
+        'message' => 'Logged out successfully'
+    ];
+}
+
+function isLoggedIn() {
+    return isset($_SESSION['username']) && !empty($_SESSION['username']);
+}
+
+function getCurrentUser() {
+    return $_SESSION['username'] ?? null;
+}
+
+function loadDevices() {
+    $json = file_get_contents(DEVICE_DB_FILE);
+    return json_decode($json, true) ?: [];
+}
+
+function saveDevices($devices) {
+    file_put_contents(DEVICE_DB_FILE, json_encode($devices));
+}
+
+function registerDevice($deviceId, $userAgent, $platform) {
+    $devices = loadDevices();
+    
+    // Check if user is logged in
+    $username = getCurrentUser();
+    if (!$username) {
+        return [
+            'success' => false,
+            'message' => 'You must be logged in to register a device'
+        ];
+    }
+    
+    // If there are already devices registered for this user
+    if (isset($devices[$username]) && count($devices[$username]) >= 1) {
+        // Check if the device is already registered
+        $existingDevice = false;
+        foreach ($devices[$username] as $id => $device) {
+            if ($id === $deviceId) {
+                $existingDevice = true;
+                // Update the last access time
+                $devices[$username][$id]['lastAccess'] = date('Y-m-d H:i:s');
+                break;
+            }
+        }
+        
+        // If it's a new device and we already have one, deny access
+        if (!$existingDevice) {
+            // Check if the existing device is still active (accessed in the last 10 minutes)
+            $isActive = false;
+            $currentTime = time();
+            
+            foreach ($devices[$username] as $id => $device) {
+                $lastAccessTime = strtotime($device['lastAccess']);
+                
+                // Consider device active if accessed in the last 10 minutes
+                if (($currentTime - $lastAccessTime) < (10 * 60)) {
+                    $isActive = true;
+                    break;
+                }
+            }
+            
+            if ($isActive) {
+                return [
+                    'success' => false,
+                    'message' => 'Access denied: Another device is already logged in for this user. Only one device allowed at a time.'
+                ];
+            } else {
+                // The previous device is no longer active, so allow this new device
+                $devices[$username] = []; // Clear old devices since they're inactive
+                $devices[$username][$deviceId] = [
+                    'deviceId' => $deviceId,
+                    'firstAccess' => date('Y-m-d H:i:s'),
+                    'lastAccess' => date('Y-m-d H:i:s'),
+                    'userAgent' => $userAgent,
+                    'platform' => $platform
+                ];
+            }
+        }
+    } else {
+        // First device for this user
+        $devices[$username][$deviceId] = [
+            'deviceId' => $deviceId,
+            'firstAccess' => date('Y-m-d H:i:s'),
+            'lastAccess' => date('Y-m-d H:i:s'),
+            'userAgent' => $userAgent,
+            'platform' => $platform
+        ];
+    }
+    
+    saveDevices($devices);
+    return [
+        'success' => true,
+        'message' => 'Device registered successfully'
+    ];
+}
+
+function checkDeviceStatus($deviceId) {
+    $devices = loadDevices();
+    $username = getCurrentUser();
+    
+    if (!$username) {
+        return [
+            'success' => false,
+            'message' => 'You must be logged in to check device status'
+        ];
+    }
+    
+    // Check if this user has this specific device registered
+    if (isset($devices[$username]) && isset($devices[$username][$deviceId])) {
+        // Update the last access time
+        $devices[$username][$deviceId]['lastAccess'] = date('Y-m-d H:i:s');
+        saveDevices($devices);
+        
+        return [
+            'success' => true,
+            'message' => 'Access granted'
+        ];
+    } else {
+        // Check if this user has any devices registered
+        if (isset($devices[$username]) && count($devices[$username]) > 0) {
+            // Check if any of the registered devices are still active
+            $isActive = false;
+            $currentTime = time();
+            
+            foreach ($devices[$username] as $id => $device) {
+                $lastAccessTime = strtotime($device['lastAccess']);
+                
+                // Consider device active if accessed in the last 10 minutes
+                if (($currentTime - $lastAccessTime) < (10 * 60)) {
+                    $isActive = true;
+                    break;
+                }
+            }
+            
+            if ($isActive) {
+                return [
+                    'success' => false,
+                    'message' => 'Access denied: Another device is already logged in for this user. Only one device allowed at a time.'
+                ];
+            } else {
+                // No active devices - allow access but require device registration
+                return [
+                    'success' => false,
+                    'message' => 'No active device registered. Please register your device first.'
+                ];
+            }
+        } else {
+            return [
+                'success' => false,
+                'message' => 'No device registered. Please register your device first.'
+            ];
+        }
+    }
+}
+
+function listDevices() {
+    $devices = loadDevices();
+    $username = getCurrentUser();
+    
+    if (!$username) {
+        return [
+            'success' => false,
+            'message' => 'You must be logged in to view devices'
+        ];
+    }
+    
+    if (isset($devices[$username])) {
+        $deviceList = array_values($devices[$username]);
+        return [
+            'success' => true,
+            'devices' => $deviceList
+        ];
+    } else {
+        return [
+            'success' => false,
+            'message' => 'No devices registered for this user'
+        ];
+    }
+}
+
+function clearOldSessions() {
+    // Remove user devices that haven't been active in more than 24 hours
+    $devices = loadDevices();
+    $currentTime = time();
+    $removedCount = 0;
+    
+    foreach ($devices as $username => $deviceList) {
+        $latestAccess = 0;
+        foreach ($deviceList as $device) {
+            $deviceTime = strtotime($device['lastAccess']);
+            if ($deviceTime > $latestAccess) {
+                $latestAccess = $deviceTime;
+            }
+        }
+        
+        // If no activity in 24 hours, remove the user's devices
+        if (($currentTime - $latestAccess) > (24 * 60 * 60)) {
+            unset($devices[$username]);
+            $removedCount++;
+        }
+    }
+    
+    saveDevices($devices);
+    return $removedCount;
+}
+
+function clearAllDevices() {
+    // Clear all device records
+    $devices = [];
+    saveDevices($devices);
+    return true;
+}
+
+function clearInactiveDevices($hours = 2) {
+    // Remove devices that haven't been active in specified hours
+    $devices = loadDevices();
+    $currentTime = time();
+    $removedCount = 0;
+    
+    foreach ($devices as $username => $deviceList) {
+        $activeDevices = [];
+        foreach ($deviceList as $deviceId => $device) {
+            $deviceTime = strtotime($device['lastAccess']);
+            // If device was active within the specified hours, keep it
+            if (($currentTime - $deviceTime) <= ($hours * 60 * 60)) {
+                $activeDevices[$deviceId] = $device;
+            } else {
+                $removedCount++;
+            }
+        }
+        
+        // If no active devices left for this user, remove the user
+        if (empty($activeDevices)) {
+            unset($devices[$username]);
+        } else {
+            $devices[$username] = $activeDevices;
+        }
+    }
+    
+    saveDevices($devices);
+    return $removedCount;
+}
+
+// Handle API requests if this is an AJAX call
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+    strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest') {
+    $action = $_POST['action'] ?? '';
+    $response = [];
+    
+    switch ($action) {
+        case 'login':
+            $username = $_POST['username'] ?? '';
+            $password = $_POST['password'] ?? '';
+            $deviceId = $_POST['deviceId'] ?? '';
+            $userAgent = $_POST['userAgent'] ?? '';
+            $platform = $_POST['platform'] ?? '';
+            
+            if (empty($username) || empty($password)) {
+                $response = [
+                    'success' => false,
+                    'message' => 'Username and password are required'
+                ];
+            } else {
+                $response = authenticateUser($username, $password, $deviceId, $userAgent, $platform);
+            }
+            break;
+            
+        case 'logout':
+            $response = logoutUser();
+            break;
+            
+        case 'register':
+            $deviceId = $_POST['deviceId'] ?? '';
+            $userAgent = $_POST['userAgent'] ?? '';
+            $platform = $_POST['platform'] ?? '';
+            
+            if (empty($deviceId)) {
+                $response = [
+                    'success' => false,
+                    'message' => 'Device ID is required'
+                ];
+            } else {
+                $response = registerDevice($deviceId, $userAgent, $platform);
+            }
+            break;
+            
+        case 'status':
+            $deviceId = $_POST['deviceId'] ?? '';
+            
+            if (empty($deviceId)) {
+                $response = [
+                    'success' => false,
+                    'message' => 'Device ID is required'
+                ];
+            } else {
+                $response = checkDeviceStatus($deviceId);
+            }
+            break;
+            
+        case 'list':
+            $response = listDevices();
+            break;
+            
+        case 'cleanup':
+            $type = $_POST['type'] ?? 'old';
+            $param = $_POST['param'] ?? 24;
+            
+            switch ($type) {
+                case 'all':
+                    $result = clearAllDevices();
+                    $response = [
+                        'success' => $result,
+                        'message' => $result ? 'All devices cleared' : 'Error clearing devices'
+                    ];
+                    break;
+                    
+                case 'inactive':
+                    $hours = intval($param);
+                    $removedCount = clearInactiveDevices($hours);
+                    $response = [
+                        'success' => true,
+                        'message' => "Removed $removedCount inactive devices (inactive for more than $hours hours)"
+                    ];
+                    break;
+                    
+                case 'old':
+                default:
+                    $removedCount = clearOldSessions();
+                    $response = [
+                        'success' => true,
+                        'message' => "Removed $removedCount old sessions (inactive for more than 24 hours)"
+                    ];
+            }
+            break;
+            
+        case 'check_login':
+            $response = [
+                'success' => isLoggedIn(),
+                'username' => getCurrentUser()
+            ];
+            break;
+            
+        default:
+            $response = [
+                'success' => false,
+                'message' => 'Invalid action'
+            ];
+    }
+    
+    header('Content-Type: application/json');
+    echo json_encode($response);
+    exit;
+}
+
+// Clear old sessions periodically (only for non-AJAX requests to avoid interfering with API calls)
+if (rand(1, 100) <= 10) { // 10% chance to clean up for demo purposes
+    clearOldSessions();
+}
+?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -158,7 +621,7 @@
             <p><strong>Device ID:</strong> <span id="deviceId">Detecting...</span></p>
             <p><strong>User Agent:</strong> <span id="userAgent"></span></p>
             <p><strong>Platform:</strong> <span id="platform"></span></p>
-            <button id="registerDevice">Register Device</button>
+            <button id="registerDevice">Re-register Device</button>
             <button id="checkDevices">Check Active Devices</button>
             <button id="cleanupDevices">Clean Up Old Devices</button>
         </div>
@@ -190,7 +653,7 @@
                 $(this).prop('disabled', true).text('Cleaning up...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'cleanup',
@@ -217,7 +680,7 @@
                 $(this).prop('disabled', true).text('Removing All...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'cleanup',
@@ -278,7 +741,7 @@
             
             function checkLoginStatus() {
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'check_login'
@@ -320,16 +783,19 @@
                 $(this).prop('disabled', true).text('Logging in...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'login',
                         username: username,
-                        password: password
+                        password: password,
+                        deviceId: deviceId,
+                        userAgent: navigator.userAgent,
+                        platform: navigator.platform
                     },
                     success: function(response) {
                         if (response.success) {
-                            $('#accessStatus').html('<div class="access-allowed">Login successful. Please register your device.</div>');
+                            $('#accessStatus').html('<div class="access-allowed">Login successful. Device automatically registered.</div>');
                             checkLoginStatus();
                         } else {
                             $('#accessStatus').html('<div class="access-denied">' + response.message + '</div>');
@@ -348,7 +814,7 @@
                 $(this).prop('disabled', true).text('Logging out...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'logout'
@@ -372,7 +838,7 @@
             // Check device status
             function checkDeviceStatus() {
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'status',
@@ -380,7 +846,7 @@
                     },
                     success: function(response) {
                         if (response.success) {
-                            $('#accessStatus').html('<div class="access-allowed">Access granted. Your device is registered.</div>');
+                            $('#accessStatus').html('<div class="access-allowed">Access granted. Device is registered and active.</div>');
                         } else {
                             $('#accessStatus').html('<div class="access-denied">' + response.message + '</div>');
                         }
@@ -394,10 +860,10 @@
             
             // Register device on the server
             $('#registerDevice').click(function() {
-                $(this).prop('disabled', true).text('Registering...');
+                $(this).prop('disabled', true).text('Re-registering...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'register',
@@ -407,16 +873,16 @@
                     },
                     success: function(response) {
                         if (response.success) {
-                            $('#accessStatus').html('<div class="access-allowed">Device registered successfully. Access granted.</div>');
+                            $('#accessStatus').html('<div class="access-allowed">Device re-registered successfully. Access granted.</div>');
                         } else {
                             $('#accessStatus').html('<div class="access-denied">' + response.message + '</div>');
                         }
-                        $(this).prop('disabled', false).text('Register Device');
+                        $(this).prop('disabled', false).text('Re-register Device');
                         checkActiveDevices(); // Refresh device list
                     },
                     error: function() {
-                        alert('Error registering device');
-                        $(this).prop('disabled', false).text('Register Device');
+                        alert('Error re-registering device');
+                        $(this).prop('disabled', false).text('Re-register Device');
                     }
                 });
             });
@@ -429,7 +895,7 @@
                 $(this).prop('disabled', true).text('Cleaning up...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'cleanup',
@@ -449,7 +915,7 @@
             
             function checkActiveDevices() {
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'list'
@@ -483,7 +949,7 @@
                 $(this).prop('disabled', true).text('Cleaning up...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'cleanup',
@@ -510,7 +976,7 @@
                 $(this).prop('disabled', true).text('Removing All...');
                 
                 $.ajax({
-                    url: 'device_tracker.php',
+                    url: '',
                     method: 'POST',
                     data: {
                         action: 'cleanup',
